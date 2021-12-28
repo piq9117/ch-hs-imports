@@ -17,6 +17,7 @@
 , stdenv
 , text
 , transformers
+, lib
 }:
 mkDerivation {
   pname = "ch-hs-imports";
@@ -43,5 +44,5 @@ mkDerivation {
     text
     transformers
   ];
-  license = stdenv.lib.licenses.mit;
+  license = lib.licenses.mit;
 }
