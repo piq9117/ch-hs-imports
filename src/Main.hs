@@ -1,3 +1,4 @@
+{-# language BlockArguments #-}
 {-# language OverloadedStrings #-}
 {-# language FlexibleContexts #-}
 {-# language LambdaCase #-}
@@ -20,6 +21,7 @@ import Control.Arrow ((>>>))
 import Control.Monad
 import Data.Bifunctor (first, second, bimap)
 import qualified Data.Char as Char
+import Data.Either ( partitionEithers )
 import Data.Foldable
 import Data.Function
 import Data.Functor
@@ -27,6 +29,7 @@ import qualified Data.List as List
 import Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe
+import Data.Ord (Down(Down))
 import Data.Tuple (swap)
 import Data.Void
 import GHC.Generics (Generic)
@@ -382,7 +385,16 @@ parseImport = (<?> "parseImport") $ do
     (<?> "spacesFollowingImport") $
     Text.pack <$> some spaceChar
 
+  maybeSource <-
+    (<?> "maybeSource") $
+    try (Just <$> string "{-# SOURCE #-}") <|> 
+    try (Just <$> string "{-# source #-}") <|> 
+    pure Nothing
 
+  spacesFollowingSource <-
+    (<?> "spacesFollowingSource") $
+    Text.pack <$> many spaceChar
+ 
   maybeQualified <-
     (<?> "maybeQualified") $
     try (Just <$> string "qualified") <|> pure Nothing
@@ -425,6 +437,8 @@ parseImport = (<?> "parseImport") $ do
             (mconcat
               [ textImport
               , spacesFollowingImport
+              , fromMaybe "" maybeSource
+              , spacesFollowingSource
               , fromMaybe "" maybeQualified
               , spacesFollowingQualified
               , maybe "" (\packageName -> "\"" <> packageName <> "\"") maybePackageName
@@ -540,6 +554,10 @@ pickPackage (AbsoluteFilePath filePath) localPackages_ = NESet.toList >>> \case
                           takeDirectory pathToCabalFile `List.isPrefixOf` filePath
 
                   )
+              -- When we have a cabal project with anohter cabal project in a subdirectory
+              -- we need to take the longest matching path. That is match to the cabal project
+              -- closest to file.
+              & List.sortOn (Down . pathToCabalFile)
               & listToMaybe
 
           manyMatches
@@ -617,7 +635,10 @@ projectModules filePath = do
       cabalFiles <-
         gatherFiles ".cabal" (takeDirectory cabalProjectFile)
 
-      traverse (localModules . unAbsoluteFilePath) cabalFiles <&> mconcat
+      (localPackages, modules) <-
+        traverse (localModules . unAbsoluteFilePath) cabalFiles <&> mconcat
+
+      pure (localPackages, removeLocalPackagePrefixes <$> modules)
 
     Nothing ->
       pure (Set.empty, MonoidalMap.empty)
@@ -653,30 +674,29 @@ localModules filePath = do
                 Right x -> pure x
           & liftIO
 
-      gatherFiles ".hs" (takeDirectory cabalPath)
+      let localPackage =
+            LocalPackage
+              { packageName =
+                  PackageName
+                    . Text.pack
+                    . takeBaseName
+                    $ cabalPath
+              , pathToCabalFile = AbsoluteFilePath cabalPath
+              , ..
+              }
+
+      moduleMap <- gatherFiles ".hs" (takeDirectory cabalPath)
         >>= parMapM (fmap (either (const Nothing) Just . parse parseModuleAndModuleName "") . (liftIO . Text.readFile) . unAbsoluteFilePath)
         <&> mapMaybe
               (fmap $ \moduleName ->
-                let localPackage =
-                      LocalPackage
-                        { packageName =
-                            PackageName
-                              . Text.pack
-                              . takeBaseName
-                              $ cabalPath
-                        , pathToCabalFile = AbsoluteFilePath cabalPath
-                        , ..
-                        }
-                in
-                  (  Set.singleton localPackage
-                  ,  MonoidalMap.singleton
-                      moduleName
-                      ( NESet.singleton (ALocalPackage localPackage)
-                      )
+                 MonoidalMap.singleton
+                  moduleName
+                  ( NESet.singleton (ALocalPackage localPackage)
                   )
-
               )
         <&> mconcat
+
+      pure (Set.singleton localPackage, moduleMap)
 
 
     Nothing ->
@@ -738,7 +758,7 @@ parseCabalDependencies :: Parser [PackageName]
 parseCabalDependencies = do
   colStartPos <-
     skipManyTill
-      (try otherLine)
+      otherLine
       (try parseBuildDependsStart)
 
   some (parsePackageName colStartPos)
@@ -750,7 +770,7 @@ parseCabalDependencies = do
     parseBuildDependsStart =
       space1
         >> (mkPos . (+1) . unPos . sourceColumn <$> getSourcePos)
-        <* (string "build-depends" >> space >> void (char ':') >> space)
+        <* (string' "build-depends" >> space >> void (char ':') >> space)
         <?> "parseBuildDependsStart"
 
     parsePackageName :: Pos -> Parser PackageName
@@ -813,7 +833,7 @@ parsePackageDumpPackage = do
     skipSomeTill
       (try skipLine)
       ( asum
-          [ (,True) <$> try parseExposedModules
+          [ (,True) <$> parseExposedModules
           , ([], False) <$ try packageEnd
           ]
       )
@@ -832,21 +852,56 @@ parsePackageDumpPackage = do
     skipLine = manyTill (printChar <|> char '\t') eol
 
     parseName =
-      string "name:" >> skipSome nonEolSpaceChar >> someTill printChar eol
+      string' "name:" >> skipSome nonEolSpaceChar >> someTill printChar eol
 
     parseExposedModules =
-      string "exposed-modules:"
+      string' "exposed-modules:"
         >> (void eol <|> pure ())
         >> some
-             ( try
-                $ skipSome nonEolSpaceChar
-                >> sepBy1 parseModuleName nonEolSpaceChar
+             ( skipSome nonEolSpaceChar
+                >> sepBy1 (parseModuleName <* optional from <* optional ",") nonEolSpaceChar
                 <* eol
              )
              <&> concat
 
     packageEnd = try (string "---" >> (void eol <|> eof)) <|> eof
 
+    from = do
+      _ <- " from " 
+      some $ choice [ alphaNumChar, char '-', char ':', char '.' ]
+
 nonEolSpaceChar :: Parser ()
 nonEolSpaceChar =
   void $ notFollowedBy eol >> (spaceChar <|> char '\t')
+
+
+-- The way gatherFiles works is that it locates .hs files in the
+-- subdirectories of a directory with a .cabal file in it, but those
+-- subdirectories in turn have a .cabal file in it, then .hs files beneath
+-- that directory should not be treated as being part of the parent package.
+removeLocalPackagePrefixes :: NESet PackageSource -> NESet PackageSource
+removeLocalPackagePrefixes set = NESet.fromList packages'
+  where
+    packages = NESet.toList set
+    (locals, globals) = partitionPackages (toList packages)
+    locals' = removePrefixes cabalDir locals
+      where
+        cabalDir = takeDirectory . unAbsoluteFilePath . pathToCabalFile
+    packages' = fromMaybe packages $ NonEmpty.nonEmpty $
+      ALocalPackage <$> locals' <|> AGlobalPackage <$> globals
+
+
+partitionPackages :: [PackageSource] -> ([LocalPackage], [PackageName])
+partitionPackages = partitionEithers . map \case
+  ALocalPackage localPackage -> Left localPackage
+  AGlobalPackage globalPackage -> Right globalPackage
+
+
+removePrefixes :: Eq b => (a -> [b]) -> [a] -> [a]
+removePrefixes f input =
+  filter (\a -> none (f a `prefix`) (f <$> input)) input
+  where
+    prefix a b = case a `List.stripPrefix` b of
+      Just (_ : _) -> True
+      _ -> False
+    none = (not .) . any
